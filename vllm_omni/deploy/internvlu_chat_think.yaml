@@ -1,0 +1,41 @@
+# InternVL-U think-mode (text-then-image) deploy.
+#
+# Inherits internvlu_chat.yaml.  In this deployment Stage 0 first decodes a
+# chain-of-thought description of the target image and then enters image
+# generation through an actual <img> token, matching the reference
+# implementation's CoT generation mode (Stage 1 also switches to the weaker
+# 3.5/1.5 guidance defaults automatically).
+#
+# One knob drives the whole mechanism: the engine-level
+# ``mm_processor_kwargs.think`` flag below is deployment-level (requests
+# cannot toggle it) and is read by both halves —
+#   - the multimodal processor formats image-generation prompts without a
+#     trailing <img> so the VLM decodes the CoT first (per-request
+#     internvlu_generation_mode still wins, which is how the CFG companion
+#     prompts keep their direct <img>-terminated form), and
+#   - the model-local sampler replaces the CoT-terminating EOS with <img>.
+# max_tokens covers the reference CoT budget (max_new_tokens=200) plus the
+# two internal tokens (<img> + forced EOS); requests that set max_tokens
+# explicitly still override it.  If a CoT exhausts max_tokens before its
+# terminating EOS, the request fails with a clear stage-bridge error rather
+# than falling back to a truncated CoT (the reference's offline fallback
+# needs an extra decode step for the <img> hidden state, which a streaming
+# engine cannot produce retroactively) — keep request max_tokens generous.
+#
+# Scope: use this deployment for image generation.  Text-only chat still
+# works, but every reply terminates through an internal <img> + EOS pair
+# (hidden from detokenized output) and pays two extra decode steps; prefer
+# internvlu_chat.yaml for chat-heavy workloads.
+#
+# Select this topology via:
+#   vllm serve InternVL-U/InternVL-U --omni \
+#       --deploy-config vllm_omni/deploy/internvlu_chat_think.yaml
+
+base_config: internvlu_chat.yaml
+
+stages:
+  - stage_id: 0
+    mm_processor_kwargs:
+      think: true
+    default_sampling_params:
+      max_tokens: 202
