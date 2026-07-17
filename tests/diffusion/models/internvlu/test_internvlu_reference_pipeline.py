@@ -169,6 +169,7 @@ def _make_pipeline() -> InternVLUPipeline:
     pipeline = InternVLUPipeline.__new__(InternVLUPipeline)
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
+    pipeline.vlm_cond_hidden_size = 4096
     pipeline.vae = _FakeVAE()
     pipeline.vae_scale_factor = 8
     pipeline.latent_channels = 16

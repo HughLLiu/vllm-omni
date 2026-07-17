@@ -85,15 +85,15 @@ extra-body params (see the [online serving example](../../online_serving/internv
 - Negative prompts are not supported (InternVL-U uses fixed partial and
   unconditional CFG prompts).
 - Video understanding is not yet ported.
-- In think mode, a chain-of-thought that exhausts `max_tokens` before its
-  terminating EOS fails with a clear error instead of truncating (the
-  official offline fallback needs an extra decode step that a streaming
-  engine cannot produce); the think deployment budgets `max_tokens: 202`
-  to cover the reference CoT length.
+- In think mode the CoT is capped at the reference's 200 tokens: the
+  sampler forces the `<img>` transition at the cap, and the think
+  deployment budgets `max_tokens: 202` to fit it plus the two internal
+  tokens.  A per-request `max_tokens` override too small for its CoT
+  fails with a clear stage-bridge error instead of truncating.
 
 ## Reproducing the E2E Test
 
-The nightly pixel-parity test serves the model and compares against goldens
+The weekly pixel-parity test serves the model and compares against goldens
 generated with the official repository:
 
 ```bash

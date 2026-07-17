@@ -37,7 +37,7 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
 from tests.helpers.stage_config import get_deploy_config_path
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
 MODEL_ID = "InternVL-U/InternVL-U"
 MODEL_ENV_VAR = "INTERNVLU_MODEL"

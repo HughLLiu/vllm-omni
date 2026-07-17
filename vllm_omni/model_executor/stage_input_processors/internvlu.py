@@ -19,10 +19,12 @@ import torch
 PARTIAL_SUFFIX = "__internvlu_partial"
 UNCONDITIONAL_SUFFIX = "__internvlu_unconditional"
 
+# Do not reorder CFG_ROLES: Stage 1 builds its CFG batch in this order
+# and unpacks the denoiser output positionally against it.
 CONDITIONAL_ROLE = "conditional"
 PARTIAL_ROLE = "partial"
 UNCONDITIONAL_ROLE = "unconditional"
-_ROLES = (CONDITIONAL_ROLE, PARTIAL_ROLE, UNCONDITIONAL_ROLE)
+CFG_ROLES = (CONDITIONAL_ROLE, PARTIAL_ROLE, UNCONDITIONAL_ROLE)
 
 IM_START_TOKEN_ID = 151644
 EOS_TOKEN_ID = 151645
@@ -30,9 +32,6 @@ IMG_START_TOKEN_ID = 151669
 IMG_END_TOKEN_ID = 151670
 IMG_CONTEXT_TOKEN_ID = 151671
 IMG_CONTEXT_TOKENS_PER_IMAGE = 256
-# Hidden size of the serialized Stage-0 conditioning stream; fixed by the
-# released checkpoint (generation_decoder input_hidden_size).
-VLM_COND_HIDDEN_SIZE = 4096
 
 PARTIAL_EDIT_TEXT = "Generate an image based on reference images."
 PURE_UNCONDITIONAL_TEXT = "Here is a random image <img_uncond>:"
@@ -290,7 +289,7 @@ def _bind_roles(source_outputs: list[Any]) -> dict[str, Any]:
             raise ValueError(f"Duplicate InternVL-U CFG role {role!r}")
         bound[role] = source_output
 
-    missing = [role for role in _ROLES if role not in bound]
+    missing = [role for role in CFG_ROLES if role not in bound]
     if missing:
         raise ValueError(f"Missing InternVL-U CFG role(s): {', '.join(missing)}")
 
@@ -344,10 +343,12 @@ def _conditioning_tensor(source_output: Any, completion: Any, role: str) -> torc
         conditioning = _mapping_get(payload, "hidden_states.output")
     if not isinstance(conditioning, torch.Tensor):
         raise ValueError(f"InternVL-U {role} branch is missing hidden_states.output")
-    if conditioning.ndim != 2 or conditioning.shape[-1] != VLM_COND_HIDDEN_SIZE:
+    # The conditioning width is checkpoint configuration owned by Stage 1
+    # (generation_decoder input_hidden_size); the bridge validates only the
+    # row structure its own slicing depends on.
+    if conditioning.ndim != 2:
         raise ValueError(
-            f"InternVL-U {role} conditioning must have shape [T, {VLM_COND_HIDDEN_SIZE}], "
-            f"got {tuple(conditioning.shape)}"
+            f"InternVL-U {role} conditioning must be a [T, hidden] matrix, got {tuple(conditioning.shape)}"
         )
     if not conditioning.is_floating_point():
         raise TypeError(f"InternVL-U {role} conditioning must be floating point")
@@ -440,7 +441,6 @@ def _build_branch(
     ).reshape(reference_count, 3)
 
     return {
-        "token_ids": torch.tensor(sliced_ids, dtype=torch.long),
         "encoder_hidden_states": sliced_hidden,
         "encoder_image_token_mask": torch.tensor(
             [token_id == IMG_CONTEXT_TOKEN_ID for token_id in sliced_ids],
@@ -527,7 +527,7 @@ def ar2diffusion(
         PARTIAL_ROLE: reference_count,
         UNCONDITIONAL_ROLE: 0,
     }
-    branches = {role: _build_branch(role_outputs[role], role, expected_reference_counts[role]) for role in _ROLES}
+    branches = {role: _build_branch(role_outputs[role], role, expected_reference_counts[role]) for role in CFG_ROLES}
 
     # Text-then-image: the conditional branch generated CoT text before the
     # terminal <img>; direct image requests emit only the forced EOS.
@@ -571,8 +571,12 @@ def ar2diffusion(
 
 
 __all__ = [
+    "CFG_ROLES",
+    "CONDITIONAL_ROLE",
     "ExpandedPrompt",
+    "PARTIAL_ROLE",
     "PARTIAL_SUFFIX",
+    "UNCONDITIONAL_ROLE",
     "UNCONDITIONAL_SUFFIX",
     "ar2diffusion",
     "expand_cfg_prompts",

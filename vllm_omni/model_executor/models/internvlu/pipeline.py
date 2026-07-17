@@ -13,6 +13,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.internvlu"
 
 INTERNVLU_PIPELINE = PipelineConfig(
     model_type="internvlu_chat",
+    default_deploy_config_name="internvlu_chat.yaml",
     model_arch="InternVLUChatModel",
     hf_architectures=("InternVLUChatModel",),
     diffusers_class_name="InternVLUPipeline",

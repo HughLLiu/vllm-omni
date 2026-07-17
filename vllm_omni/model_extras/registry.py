@@ -34,7 +34,6 @@ from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
 )
-from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.internvlu import (
     INTERNVLU_EXTRA_BODY_PARAMS,
     INTERNVLU_EXTRA_OUTPUT_PARAMS,
@@ -45,6 +44,7 @@ from vllm_omni.model_extras.internvlu import (
 from vllm_omni.model_extras.internvlu import (
     build_text_to_image_prompt as build_internvlu_text_to_image_prompt,
 )
+from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.magi_human import (
     MAGI_HUMAN_EXTRA_BODY_PARAMS,
     MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,

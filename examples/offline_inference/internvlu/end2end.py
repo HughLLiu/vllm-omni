@@ -187,9 +187,11 @@ def main():
                 print(f"[CoT]\n{cot_text}\n")
 
         if is_text_output:
-            text = getattr(req_output, "text", None)
-            if text:
-                print(f"[Response]\n{text}")
+            completion_outputs = getattr(request_output, "outputs", None) or []
+            text = getattr(completion_outputs[0], "text", None) if completion_outputs else None
+            if not isinstance(text, str) or not text.strip():
+                raise RuntimeError("InternVL-U returned no text completion.")
+            print(f"[Response]\n{text}")
             continue
 
         for image in getattr(req_output, "images", None) or []:

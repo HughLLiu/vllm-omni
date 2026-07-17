@@ -34,15 +34,17 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.model_executor.stage_input_processors.internvlu import (
+    CFG_ROLES,
+    CONDITIONAL_ROLE,
+    PARTIAL_ROLE,
+    UNCONDITIONAL_ROLE,
+)
 
 from .internvlu_transformer import InternVLUTransformer2DModel
 
 logger = init_logger(__name__)
 
-_ROLES = ("conditional", "partial", "unconditional")
-# Hidden size of the Stage-0 VLM conditioning stream; fixed by the released
-# checkpoint (generation_decoder input_hidden_size == joint_attention_dim).
-_VLM_COND_HIDDEN_SIZE = 4096
 _EXPECTED_DECODER_CONFIG = {
     "patch_size": 2,
     "in_channels": 64,
@@ -50,7 +52,6 @@ _EXPECTED_DECODER_CONFIG = {
     "num_layers": 20,
     "attention_head_dim": 128,
     "num_attention_heads": 12,
-    "joint_attention_dim": _VLM_COND_HIDDEN_SIZE,
     "axes_dims_rope": [16, 56, 56],
     "video_position_scale_factor": 1.0,
     "vlm_cond_position_scale_factor": 0.25,
@@ -97,8 +98,6 @@ def _validate_generation_config(config: dict[str, Any]) -> None:
         "padding_encoder_hidden_states": True,
         "pad_to_fix_length": False,
         "max_sequence_length": 768,
-        "input_hidden_size": _VLM_COND_HIDDEN_SIZE,
-        "output_hidden_size": _VLM_COND_HIDDEN_SIZE,
         "vae_downsample_factor": 8,
     }
     for key, expected in expected_wrapper.items():
@@ -116,6 +115,24 @@ def _validate_generation_config(config: dict[str, Any]) -> None:
             raise ValueError(
                 f"unsupported InternVL-U decoder config {key}={actual!r}; checkpoint contract requires {expected!r}"
             )
+
+    # The conditioning width is checkpoint configuration, not a pipeline
+    # constant: Stage 1 sizes every conditioning shape check and dummy
+    # tensor from input_hidden_size, so the three declarations of the width
+    # must agree.
+    hidden_size = config.get("input_hidden_size")
+    if not isinstance(hidden_size, int) or isinstance(hidden_size, bool) or hidden_size <= 0:
+        raise ValueError(f"generation_decoder input_hidden_size must be a positive integer, got {hidden_size!r}")
+    output_hidden_size = config.get("output_hidden_size")
+    if output_hidden_size != hidden_size:
+        raise ValueError(
+            f"generation_decoder output_hidden_size={output_hidden_size!r} must match input_hidden_size={hidden_size}"
+        )
+    joint_attention_dim = decoder_config.get("joint_attention_dim")
+    if joint_attention_dim != hidden_size:
+        raise ValueError(
+            f"generation_decoder joint_attention_dim={joint_attention_dim!r} must match input_hidden_size={hidden_size}"
+        )
 
 
 def _retrieve_mode(encoder_output: Any) -> torch.Tensor:
@@ -291,6 +308,9 @@ class InternVLUPipeline(
         model = od_config.model
         local_files_only = os.path.isdir(model)
         self.generation_config = _load_generation_config(model, od_config.revision)
+        # Conditioning width comes from the checkpoint's generation config
+        # (validated for input/output/joint_attention_dim consistency above).
+        self.vlm_cond_hidden_size = int(self.generation_config["input_hidden_size"])
         decoder_config = self.generation_config["decoder_config"]
         self.transformer = InternVLUTransformer2DModel(
             od_config=od_config,
@@ -356,9 +376,9 @@ class InternVLUPipeline(
         reference_indices = payload.get("reference_image_indices")
         if not isinstance(hidden_states, torch.Tensor):
             raise ValueError(f"{role} branch is missing encoder_hidden_states")
-        if hidden_states.ndim != 2 or hidden_states.shape[-1] != _VLM_COND_HIDDEN_SIZE:
+        if hidden_states.ndim != 2 or hidden_states.shape[-1] != self.vlm_cond_hidden_size:
             raise ValueError(
-                f"{role} conditioning must be [T,{_VLM_COND_HIDDEN_SIZE}], got {tuple(hidden_states.shape)}"
+                f"{role} conditioning must be [T,{self.vlm_cond_hidden_size}], got {tuple(hidden_states.shape)}"
             )
         if not isinstance(image_mask, torch.Tensor):
             raise ValueError(f"{role} branch is missing encoder_image_token_mask")
@@ -401,12 +421,12 @@ class InternVLUPipeline(
             width = max(16, default_width // 16 * 16)
             branches = {
                 role: {
-                    "encoder_hidden_states": torch.zeros(1, _VLM_COND_HIDDEN_SIZE),
+                    "encoder_hidden_states": torch.zeros(1, self.vlm_cond_hidden_size),
                     "encoder_image_token_mask": torch.zeros(1, dtype=torch.bool),
                     "image_fhw_cond": torch.empty(0, 3, dtype=torch.long),
                     "reference_image_indices": torch.empty(0, dtype=torch.long),
                 }
-                for role in _ROLES
+                for role in CFG_ROLES
             }
             return {
                 "branches": branches,
@@ -428,7 +448,7 @@ class InternVLUPipeline(
         branches_payload = private.get("branches")
         if not isinstance(branches_payload, dict):
             raise ValueError("InternVL-U bridge payload is missing branches")
-        if set(branches_payload) != set(_ROLES):
+        if set(branches_payload) != set(CFG_ROLES):
             raise ValueError("InternVL-U bridge must provide exactly conditional, partial, and unconditional branches")
 
         multi_modal_data = prompt.get("multi_modal_data")
@@ -446,12 +466,12 @@ class InternVLUPipeline(
                 role=role,
                 raw_image_count=len(raw_images),
             )
-            for role in _ROLES
+            for role in CFG_ROLES
         }
         expected_indices = list(range(len(raw_images)))
-        conditional_indices = branches["conditional"]["reference_image_indices"].tolist()
-        partial_indices = branches["partial"]["reference_image_indices"].tolist()
-        unconditional_indices = branches["unconditional"]["reference_image_indices"].tolist()
+        conditional_indices = branches[CONDITIONAL_ROLE]["reference_image_indices"].tolist()
+        partial_indices = branches[PARTIAL_ROLE]["reference_image_indices"].tolist()
+        unconditional_indices = branches[UNCONDITIONAL_ROLE]["reference_image_indices"].tolist()
         if conditional_indices != expected_indices or partial_indices != expected_indices:
             raise ValueError("editing conditional and partial branches must retain every reference image in order")
         if unconditional_indices:
@@ -574,10 +594,12 @@ class InternVLUPipeline(
     ) -> torch.Tensor:
         """Run the dual-CFG denoising loop over the prepared scheduler steps."""
         transformer_dtype = self.transformer.dtype
+        # prompt_embeds rows follow CFG_ROLES order; the unbind below relies on it.
+        num_branches = len(CFG_ROLES)
         with self.progress_bar(total=len(self.scheduler.timesteps)) as pbar:
             for timestep in self.scheduler.timesteps:
-                model_input = latents.repeat(3, 1, 1, 1).to(transformer_dtype)
-                timestep_batch = timestep.expand(3)
+                model_input = latents.repeat(num_branches, 1, 1, 1).to(transformer_dtype)
+                timestep_batch = timestep.expand(num_branches)
                 noise = self.transformer(
                     model_input,
                     encoder_hidden_states=prompt_embeds,
@@ -629,8 +651,9 @@ class InternVLUPipeline(
         branches = parsed["branches"]
         reference_latents = self._encode_reference_images(parsed["raw_images"])
 
-        hidden_states = [branches[role]["encoder_hidden_states"] for role in _ROLES]
-        image_masks = [branches[role]["encoder_image_token_mask"] for role in _ROLES]
+        # CFG_ROLES order is the batch layout diffuse() unpacks positionally.
+        hidden_states = [branches[role]["encoder_hidden_states"] for role in CFG_ROLES]
+        image_masks = [branches[role]["encoder_image_token_mask"] for role in CFG_ROLES]
         prompt_embeds, prompt_attention_mask, prompt_image_mask = self.transformer.prepare_forward_input(
             hidden_states,
             image_masks,
@@ -645,7 +668,7 @@ class InternVLUPipeline(
         )
         branch_reference_latents: list[list[torch.Tensor]] = []
         branch_image_fhw: list[torch.Tensor] = []
-        for role in _ROLES:
+        for role in CFG_ROLES:
             indices = branches[role]["reference_image_indices"].tolist()
             branch_reference_latents.append([reference_latents[index] for index in indices])
             branch_image_fhw.append(

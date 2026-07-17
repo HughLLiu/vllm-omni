@@ -49,6 +49,26 @@ def test_generation_config_rejects_shape_drift():
         _validate_generation_config(config)
 
 
+def test_generation_config_requires_consistent_conditioning_width():
+    """The conditioning width is checkpoint configuration: Stage 1 sizes its
+    checks from input_hidden_size, so the three width declarations must agree
+    and be a positive integer."""
+    config = _released_generation_config()
+    config["input_hidden_size"] = 0
+    with pytest.raises(ValueError, match="input_hidden_size"):
+        _validate_generation_config(config)
+
+    config = _released_generation_config()
+    config["output_hidden_size"] = 2048
+    with pytest.raises(ValueError, match="output_hidden_size"):
+        _validate_generation_config(config)
+
+    config = _released_generation_config()
+    config["decoder_config"]["joint_attention_dim"] = 2048
+    with pytest.raises(ValueError, match="joint_attention_dim"):
+        _validate_generation_config(config)
+
+
 def test_position_ids_cover_latents_reference_and_vlm_image():
     image_mask = torch.tensor([False, True, True, True, True, False])
     positions = build_position_ids_3d(

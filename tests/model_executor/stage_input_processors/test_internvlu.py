@@ -14,7 +14,10 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_omni.diffusion.models.internvlu.pipeline_internvlu import (
     InternVLUPipeline,
 )
-from vllm_omni.model_executor.models.internvlu.internvlu import InternVLUChatModel
+from vllm_omni.model_executor.models.internvlu.internvlu import (
+    THINK_COT_TOKEN_LIMIT,
+    InternVLUChatModel,
+)
 from vllm_omni.model_executor.models.internvlu.pipeline import INTERNVLU_PIPELINE
 from vllm_omni.model_executor.models.internvlu.processing import (
     DEFAULT_SYSTEM_MESSAGE,
@@ -22,6 +25,7 @@ from vllm_omni.model_executor.models.internvlu.processing import (
     _prepare_prompt,
 )
 from vllm_omni.model_executor.stage_input_processors.internvlu import (
+    CFG_ROLES,
     EOS_TOKEN_ID,
     IM_START_TOKEN_ID,
     IMG_CONTEXT_TOKEN_ID,
@@ -163,6 +167,11 @@ def test_edit_expansion_separates_image_output_from_img2img_processing_mode():
     assert "multi_modal_data" not in unconditional.prompt
 
 
+def test_cfg_roles_order_is_the_stage1_batch_layout():
+    """Reordering CFG_ROLES would silently swap Stage 1's CFG guidance strengths."""
+    assert CFG_ROLES == ("conditional", "partial", "unconditional")
+
+
 def test_bridge_binds_roles_by_suffix_and_builds_exact_reference_mapping():
     image0, image1 = object(), object()
     prompt = {
@@ -225,6 +234,7 @@ def test_bridge_and_stage1_preserve_stride16_generation_size():
     assert result["extra"]["internvlu"]["image_grid_thw_gen"].tolist() == [[1, 126, 128]]
 
     pipeline = InternVLUPipeline.__new__(InternVLUPipeline)
+    pipeline.vlm_cond_hidden_size = 4096
     parsed = pipeline._parse_prompt(
         result,
         sampling_params,
@@ -248,8 +258,9 @@ def _cot_conditional_output(request_id: str, cot_tokens: list[int], *, cot_text:
 
 
 def test_bridge_accepts_cot_conditional_branch_and_surfaces_text():
+    cot_tokens = [40, 41, 42]
     outputs = [
-        _cot_conditional_output("req", [40, 41, 42]),
+        _cot_conditional_output("req", cot_tokens),
         _source_output("req" + PARTIAL_SUFFIX, 0),
         _source_output("req" + UNCONDITIONAL_SUFFIX, 0),
     ]
@@ -259,14 +270,46 @@ def test_bridge_accepts_cot_conditional_branch_and_surfaces_text():
     assert payload["is_cot"] is True
     assert result["extra"]["ar_generated_text"] == "Let me plan."
     conditional = payload["branches"]["conditional"]
-    assert conditional["token_ids"][-1].item() == IMG_START_TOKEN_ID
-    assert conditional["encoder_hidden_states"].shape[0] == conditional["token_ids"].shape[0]
+    # Branches carry only what Stage 1 consumes — token ids stay bridge-local.
+    # The slice (second <|im_start|> through the terminal <img>, dropping the
+    # unaligned forced-EOS tail) is pinned via the shipped row counts.
+    assert "token_ids" not in conditional
+    prompt_ids = _prompt_ids(0)[:-1]
+    slice_start = prompt_ids.index(IM_START_TOKEN_ID, 1)
+    aligned_len = len(prompt_ids) + len(cot_tokens) + 2 - 1  # output adds <img> + EOS
+    assert conditional["encoder_hidden_states"].shape[0] == aligned_len - slice_start
+    assert conditional["encoder_image_token_mask"].shape[0] == aligned_len - slice_start
 
 
 def test_bridge_marks_direct_image_requests_as_non_cot():
     result = ar2diffusion(_three_outputs("req", 0), {"prompt": "draw"})
     assert result["extra"]["internvlu"]["is_cot"] is False
     assert "ar_generated_text" not in result["extra"]
+
+
+def test_bridge_conditioning_check_is_width_agnostic_but_structural():
+    """Stage 1 owns the conditioning width (generation_decoder
+    input_hidden_size); the bridge validates only the row structure its own
+    slicing depends on: a 2-D floating-point [T, hidden] matrix."""
+    outputs = _three_outputs("req-width", 0)
+    for source in outputs:
+        rows = source.multimodal_output["hidden_states"]["output"].shape[0]
+        source.multimodal_output["hidden_states"]["output"] = torch.zeros(rows, 8)
+    result = ar2diffusion(outputs, {"prompt": "draw"}, sampling_params=None)
+    branches = result["extra"]["internvlu"]["branches"]
+    assert branches["conditional"]["encoder_hidden_states"].shape[-1] == 8
+
+    outputs = _three_outputs("req-1d", 0)
+    rows = outputs[1].multimodal_output["hidden_states"]["output"].shape[0]
+    outputs[1].multimodal_output["hidden_states"]["output"] = torch.zeros(rows)
+    with pytest.raises(ValueError, match="matrix"):
+        ar2diffusion(outputs, {"prompt": "draw"}, sampling_params=None)
+
+    outputs = _three_outputs("req-int", 0)
+    rows = outputs[1].multimodal_output["hidden_states"]["output"].shape[0]
+    outputs[1].multimodal_output["hidden_states"]["output"] = torch.zeros(rows, 8, dtype=torch.long)
+    with pytest.raises(TypeError, match="floating point"):
+        ar2diffusion(outputs, {"prompt": "draw"}, sampling_params=None)
 
 
 def test_bridge_rejects_unknown_role_suffix():
@@ -452,8 +495,11 @@ def test_model_sampler_replaces_cot_eos_with_img_only_in_think_deployments():
     model._last_step_input_ids = torch.tensor([5, 7, 3], dtype=torch.long)
     model._last_step_query_start_loc = None
     # Single deployment-wide knob (mm_processor_kwargs.think), mirrored onto
-    # the model at construction time.
+    # the model at construction time.  Without per-request stage metadata the
+    # substitution conservatively applies to every row.
     model.think = True
+    model._last_step_image_gen_rows = None
+    model._last_step_cot_limit_rows = None
     model.img_start_token_id = 3
     model.eos_token_id = 2
 
@@ -464,3 +510,91 @@ def test_model_sampler_replaces_cot_eos_with_img_only_in_think_deployments():
 
     assert output is not None
     assert output.sampled_token_ids.tolist() == [[3], [77], [2]]
+
+
+def test_model_sampler_keeps_chat_eos_in_think_deployments():
+    """The EOS -> <img> substitution is gated per request on the engine's
+    omni_final_stage_id tag: chat rows (final stage 0) keep their sampled EOS,
+    while image-generation rows and unmarked rows take the swap."""
+
+    class FakeSampler(Sampler):
+        def forward(self, logits, sampling_metadata, **_kwargs) -> SamplerOutput:
+            # Every row samples EOS; the per-request gate alone decides.
+            return SamplerOutput(
+                sampled_token_ids=torch.tensor([[2], [2], [2]], dtype=torch.long),
+                logprobs_tensors=None,
+            )
+
+    model = InternVLUChatModel.__new__(InternVLUChatModel)
+    torch.nn.Module.__init__(model)
+    model._sampler = FakeSampler()
+    model._last_step_input_ids = torch.tensor([5, 7, 9], dtype=torch.long)
+    model._last_step_query_start_loc = None
+    model.think = True
+    model.img_start_token_id = 3
+    model.eos_token_id = 2
+    model._capture_row_metadata(
+        [
+            {"omni_final_stage_id": 0},  # chat: finalizes at the AR stage
+            {"omni_final_stage_id": 1},  # image generation: continues to diffusion
+            {},  # unmarked: conservative image-generation fallback
+        ]
+    )
+
+    output = model.sample(
+        torch.zeros(3, 8),
+        cast(SamplingMetadata, SimpleNamespace()),
+    )
+
+    assert output is not None
+    assert output.sampled_token_ids.tolist() == [[2], [3], [3]]
+
+    # Metadata from a different batch shape must not gate anything.
+    model._capture_row_metadata([{"omni_final_stage_id": 0}])
+    output = model.sample(
+        torch.zeros(3, 8),
+        cast(SamplingMetadata, SimpleNamespace()),
+    )
+
+    assert output is not None
+    assert output.sampled_token_ids.tolist() == [[3], [3], [3]]
+
+
+def test_model_sampler_forces_img_at_cot_token_limit():
+    """Image-generation rows whose CoT hits THINK_COT_TOKEN_LIMIT take <img>
+    without sampling EOS; rows under the limit, chat rows, and the
+    <img>-terminated forced-EOS step stay untouched."""
+
+    class FakeSampler(Sampler):
+        def forward(self, logits, sampling_metadata, **_kwargs) -> SamplerOutput:
+            # Every row samples ordinary text; the CoT cap alone decides.
+            return SamplerOutput(
+                sampled_token_ids=torch.tensor([[77], [77], [77], [77]], dtype=torch.long),
+                logprobs_tensors=None,
+            )
+
+    model = InternVLUChatModel.__new__(InternVLUChatModel)
+    torch.nn.Module.__init__(model)
+    model._sampler = FakeSampler()
+    # Row 3's final input is <img>: its forced EOS must survive the cap.
+    model._last_step_input_ids = torch.tensor([5, 7, 9, 3], dtype=torch.long)
+    model._last_step_query_start_loc = None
+    model.think = True
+    model.img_start_token_id = 3
+    model.eos_token_id = 2
+    model._capture_row_metadata(
+        [
+            {"omni_final_stage_id": 1, "generated_len": THINK_COT_TOKEN_LIMIT},
+            {"omni_final_stage_id": 1, "generated_len": THINK_COT_TOKEN_LIMIT - 1},
+            {"omni_final_stage_id": 0, "generated_len": THINK_COT_TOKEN_LIMIT},
+            {"omni_final_stage_id": 1, "generated_len": THINK_COT_TOKEN_LIMIT + 1},
+        ]
+    )
+
+    output = model.sample(
+        torch.zeros(4, 8),
+        cast(SamplingMetadata, SimpleNamespace()),
+    )
+
+    assert output is not None
+    assert output.sampled_token_ids.tolist() == [[3], [77], [77], [2]]

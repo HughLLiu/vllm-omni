@@ -42,6 +42,10 @@ SPECIAL_TOKENS: tuple[str, ...] = (
     "<img_uncond>",
 )
 
+# CoT limit for think-mode image generation. At the limit, sample() forces
+# <img>, followed by EOS on the next step. Chat and non-think requests are unaffected.
+THINK_COT_TOKEN_LIMIT = 200
+
 
 @MULTIMODAL_REGISTRY.register_processor(
     InternVLUMultiModalProcessor,
@@ -102,6 +106,36 @@ class InternVLUChatModel(InternVLChatModel):
         self._sampler: Sampler | None = None
         self._last_step_input_ids: torch.Tensor | None = None
         self._last_step_query_start_loc: torch.Tensor | None = None
+        self._last_step_image_gen_rows: list[bool] | None = None
+        self._last_step_cot_limit_rows: list[bool] | None = None
+
+    def _capture_row_metadata(
+        self,
+        runtime_additional_information: list[dict[str, Any]] | None,
+    ) -> None:
+        """Reduce runtime metadata to the two per-row states sample() needs.
+
+        The runner passes one dict per request, in batch order, on every
+        forward step (deploy configs pin Stage 0 to enforce_eager, so no
+        step is skipped).  The fallbacks lean opposite ways on purpose:
+
+        - image-gen row: ``omni_final_stage_id != 0``; a missing marker ->
+          True, so the EOS swap still protects an untagged image request.
+        - CoT-limit row: ``generated_len >= THINK_COT_TOKEN_LIMIT``; a
+          missing length -> False, so <img> is never forced blind.
+        """
+        if runtime_additional_information is None:
+            self._last_step_image_gen_rows = None
+            self._last_step_cot_limit_rows = None
+            return
+        image_gen_rows: list[bool] = []
+        cot_limit_rows: list[bool] = []
+        for info in runtime_additional_information:
+            image_gen_rows.append(info.get("omni_final_stage_id") != 0)
+            length = info.get("generated_len")
+            cot_limit_rows.append(isinstance(length, int) and length >= THINK_COT_TOKEN_LIMIT)
+        self._last_step_image_gen_rows = image_gen_rows
+        self._last_step_cot_limit_rows = cot_limit_rows
 
     def update_decode_step_metadata(
         self,
@@ -210,12 +244,14 @@ class InternVLUChatModel(InternVLChatModel):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         omni_query_start_loc: torch.Tensor | None = None,
+        runtime_additional_information: list[dict[str, Any]] | None = None,
         **_: object,
     ) -> OmniOutput | IntermediateTensors:
         if input_ids is not None:
             self._last_step_input_ids = input_ids
         if omni_query_start_loc is not None:
             self._last_step_query_start_loc = omni_query_start_loc
+        self._capture_row_metadata(runtime_additional_information)
         if intermediate_tensors is not None:
             inputs_embeds = None
 
@@ -245,7 +281,17 @@ class InternVLUChatModel(InternVLChatModel):
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> SamplerOutput | None:
-        """Force EOS after a request whose current final input is ``<img>``."""
+        """Sample with InternVL-U's two termination interventions.
+
+        <img> -> EOS: a row whose final input token is <img> is forced to
+        EOS, ending the request on the step after the <img> hidden state
+        was produced.
+
+        Think image generation adds CoT -> <img> -> EOS: an image-generation
+        row takes <img> once its CoT ends (a sampled EOS or the
+        THINK_COT_TOKEN_LIMIT cap), and the first rule then ends it one
+        step later.
+        """
         if logits is None or logits.numel() == 0:
             return None
         if self._sampler is None:
@@ -286,40 +332,38 @@ class InternVLUChatModel(InternVLChatModel):
                 0,
             ] = self.eos_token_id
 
-        # Think (text-then-image) deployments: the reference implementation
-        # truncates the CoT at its terminating <|im_end|> and enters image
-        # generation through an actual <img> token, so replace the sampled
-        # EOS with <img>.  The forced-EOS rule above then terminates the
-        # request one step later, after the <img> hidden state has been
-        # produced.  ``self.think`` mirrors the same engine-level
-        # mm_processor_kwargs knob the processor uses, so one deployment
-        # setting drives both halves of the mechanism.
+        # Forcing <img> at the CoT cap (instead of letting the engine's
+        # max_tokens cut end the request) keeps the one decode step needed
+        # for the <img> hidden state; the shipped think deploy budgets
+        # max_tokens 202 = cap + 2.  Rows without fresh metadata
+        # conservatively count as image generation but have no known CoT
+        # length, so only the EOS swap applies — a CoT that never samples
+        # EOS then ends at the engine cut and is reported by the stage
+        # bridge.
         #
-        # Known one-token divergence from the reference: its slicing
-        # (``eos_pos + input_ids_text.shape[1] - 1``) also drops the LAST CoT
-        # token before <|im_end|>, so its <img> conditioning sees one CoT
-        # token fewer.  That trailing ``- 1`` discards generated content with
-        # no principled basis (it reads as an off-by-one), and a streaming
-        # sampler cannot retract an already-processed token anyway, so we
-        # deliberately keep the full CoT.  Direct-mode outputs are pinned by
-        # golden-image e2e tests; think mode has a functionality-level e2e
-        # only (no reference golden yet), so this divergence is documented
-        # but not pixel-pinned.
-        #
-        # Known limitation vs the reference: if the CoT exhausts max_tokens
-        # before sampling EOS, the reference truncates at the final position
-        # and still appends <img>; producing that <img> hidden state here
-        # would need one extra decode step after the length cap fires, which
-        # a streaming sampler cannot request.  Such requests fail loudly in
-        # the stage bridge with a message naming the max_tokens remedy
-        # (internvlu_chat_think.yaml budgets 202 by default).
         if sampler_output is not None and self.think:
             sampled_token_ids = sampler_output.sampled_token_ids
-            replace_rows = ~force_eos.to(device=sampled_token_ids.device) & (
-                sampled_token_ids[:, 0] == self.eos_token_id
-            )
-            if replace_rows.any():
-                sampled_token_ids[replace_rows, 0] = self.img_start_token_id
+            device = sampled_token_ids.device
+            num_rows = sampled_token_ids.shape[0]
+
+            sampled_eos_rows = sampled_token_ids[:, 0] == self.eos_token_id
+
+            cot_limit_flags = self._last_step_cot_limit_rows
+            if cot_limit_flags is not None and len(cot_limit_flags) == num_rows:
+                cot_limit_rows = torch.tensor(cot_limit_flags, device=device)
+            else:
+                cot_limit_rows = torch.zeros(num_rows, dtype=torch.bool, device=device)
+
+            image_gen_flags = self._last_step_image_gen_rows
+            if image_gen_flags is not None and len(image_gen_flags) == num_rows:
+                image_gen_rows = torch.tensor(image_gen_flags, device=device)
+            else:
+                image_gen_rows = torch.ones(num_rows, dtype=torch.bool, device=device)
+
+            # A row on its <img> -> EOS step keeps EOS (never loop back to <img>).
+            transition_to_img_rows = (sampled_eos_rows | cot_limit_rows) & image_gen_rows & ~force_eos.to(device=device)
+            if transition_to_img_rows.any():
+                sampled_token_ids[transition_to_img_rows, 0] = self.img_start_token_id
         return sampler_output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
